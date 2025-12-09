@@ -74,6 +74,19 @@ void LocalSession::EncodeReturn(ffi::Any rv, const FEncodeReturn& encode_return)
     // encode string as c_str
     packed_args[1] = (*opt_str).data();
     encode_return(ffi::PackedArgs(packed_args, 2));
+  } else if (auto opt_arr = rv.as<ffi::Array<ffi::Any>>()) {
+    // encode array by recursively encoding each element
+    ffi::Array<ffi::Any> ret;
+    for (size_t i = 0; i < (*opt_arr).size(); ++i) {
+      ffi::AnyView item = (*opt_arr)[i];
+      ffi::AnyView single_rv;
+      this->EncodeReturn(std::move(item), [&](ffi::PackedArgs args) {
+        single_rv = args[1];
+      });
+      ret.push_back(single_rv);
+    }
+    packed_args[1] = ret;
+    encode_return(ffi::PackedArgs(packed_args, 2));
   } else if (rv.as<ffi::ObjectRef>()) {
     TVMFFIAny ret_any = ffi::details::AnyUnsafe::MoveAnyToTVMFFIAny(std::move(rv));
     void* opaque_handle = ret_any.v_obj;

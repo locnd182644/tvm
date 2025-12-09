@@ -319,6 +319,32 @@ void RPCWrappedFunc::WrapRemoteReturnToValue(ffi::PackedArgs args, ffi::Any* rv)
              type_index == ffi::TypeIndex::kTVMFFISmallBytes) {
     ICHECK_EQ(args.size(), 2);
     *rv = args[1];
+  } else if (type_index == ffi::TypeIndex::kTVMFFIArray) {
+    ICHECK_EQ(args.size(), 2);
+    auto arr = args[1].cast<ffi::Array<ffi::Any>>();
+    ffi::Array<ffi::Any> ret;
+    for (size_t i = 0; i < arr.size(); ++i) {
+      ffi::AnyView item = arr[i];
+      ffi::Any single_rv;
+      int type = item.type_index();
+      if (type == ffi::TypeIndex::kTVMFFITensor ||
+          type == ffi::TypeIndex::kTVMFFIDLTensorPtr) {
+        ffi::AnyView packed_args[3];
+        packed_args[0] = item.type_index();
+        packed_args[1] = item;
+        TVMFFIAny ret_any = ffi::details::AnyUnsafe::MoveAnyToTVMFFIAny(std::move(item));
+        void* opaque_handle = ret_any.v_obj;
+        packed_args[2] = opaque_handle;
+        WrapRemoteReturnToValue(ffi::PackedArgs(packed_args, 3), &single_rv);
+      } else {
+        ffi::AnyView packed_args[2];
+        packed_args[0] = item.type_index();
+        packed_args[1] = item;
+        WrapRemoteReturnToValue(ffi::PackedArgs(packed_args, 2), &single_rv);
+      }
+      ret.push_back(single_rv);
+    }
+    *rv = ret;
   } else if (type_index >= ffi::TypeIndex::kTVMFFIStaticObjectBegin) {
     ICHECK_EQ(args.size(), 2);
     void* handle = args[1].cast<void*>();
