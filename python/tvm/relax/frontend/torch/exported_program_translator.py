@@ -23,6 +23,7 @@ from functools import partial
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
+from torch import fx
 import tvm
 from tvm import relax
 
@@ -31,8 +32,6 @@ from .base_fx_graph_translator import BaseFXGraphImporter
 
 class ExportedProgramImporter(BaseFXGraphImporter):
     """An importer from ExportedProgram to Relax."""
-
-    from torch import fx
 
     @staticmethod
     def _convert_pytorch_tensor_to_tvm(tensor_value: torch.Tensor) -> tvm.runtime.Tensor:
@@ -122,6 +121,8 @@ class ExportedProgramImporter(BaseFXGraphImporter):
         x = self.env[node.args[0]]
         channel = int(self.shape_of(x)[1])
         dtype = x.struct_info.dtype
+        scale = node.args[1] is not None
+        center = node.args[2] is not None
         weight = self.env.get(node.args[1], relax.const(np.ones(channel), dtype=dtype))
         bias = self.env.get(node.args[2], relax.const(np.zeros(channel), dtype=dtype))
         running_mean = self.env.get(node.args[3], relax.const(np.zeros(channel), dtype=dtype))
@@ -135,10 +136,6 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             eps = node.args[6] if len(node.args) > 6 else node.kwargs.get("eps", 1e-05)
             training = False
         elif target_name.startswith("_native_batch_norm_legit_functional"):
-            momentum = node.args[5] if len(node.args) > 5 else node.kwargs.get("momentum", 0.1)
-            eps = node.args[6] if len(node.args) > 6 else node.kwargs.get("eps", 1e-05)
-            training = True
-        else:
             ignore_running_stats = (
                 node.args[5] if len(node.args) > 5 else node.kwargs.get("track_running_stats", True)
             )
@@ -148,6 +145,10 @@ class ExportedProgramImporter(BaseFXGraphImporter):
 
             if track_running_stats:
                 training = True
+        else:
+            momentum = node.args[5] if len(node.args) > 5 else node.kwargs.get("momentum", 0.1)
+            eps = node.args[6] if len(node.args) > 6 else node.kwargs.get("eps", 1e-05)
+            training = True
 
         bn_result = self.block_builder.emit(
             relax.op.nn.batch_norm(
@@ -158,6 +159,8 @@ class ExportedProgramImporter(BaseFXGraphImporter):
                 moving_var=running_var,
                 axis=1,  # Always over channel
                 epsilon=eps,
+                scale=scale,
+                center=center,
                 momentum=momentum,
                 training=training,
             )
@@ -198,9 +201,11 @@ class ExportedProgramImporter(BaseFXGraphImporter):
         bias = self.env.get(node.args[2], relax.const(np.zeros(channel), dtype=dtype))
         eps = node.args[5] if len(node.args) > 5 else node.kwargs.get("eps", 1e-05)
 
-        # Determine axes for instance norm (all spatial dimensions after channel)
+        # Shared by InstanceNorm (view as [1, N*C, H, W])
+        # and eval-mode BatchNorm without track_running_stats
+        # Determine axes for instance norm (all spatial dimensions after channel and batch dim)
         dim = len(self.shape_of(x))
-        axes = list(range(2, dim))
+        axes = [0] + list(range(2, dim))
 
         return self.block_builder.emit(
             relax.op.nn.instance_norm(
@@ -337,11 +342,11 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             )
 
         else:
-            # TODO figure out why pytorch export passes a list such as
-            # [scale_factor,scale_factor] instead of just an int for
-            # scale_factor. Using first element for now
+            # PyTorch export passes scale_factor as either a scalar or a list/tuple
+            # (e.g., [2.0, 3.0] for different H and W scaling).
+            # Pass it as-is to _upsample_impl which handles both cases correctly.
             scale_factor = (
-                node.args[2][0] if len(node.args) > 2 else node.kwargs.get("scale_factor", 1)
+                node.args[2] if len(node.args) > 2 else node.kwargs.get("scale_factor", 1)
             )
             align_corners = (
                 node.args[3] if len(node.args) > 3 else node.kwargs.get("align_corners", None)
@@ -364,11 +369,11 @@ class ExportedProgramImporter(BaseFXGraphImporter):
         if size is not None:
             scale_factor = None
         else:
-            scale_arg = node.args[3] if len(node.args) > 3 else node.kwargs.get("scale_factor", 1)
-            if isinstance(scale_arg, (list, tuple)):
-                scale_factor = scale_arg[0]
-            else:
-                scale_factor = scale_arg
+            # PyTorch export passes scale_factor as either a scalar or a list/tuple.
+            # Pass it as-is to _upsample_impl which handles both cases correctly.
+            scale_factor = (
+                node.args[3] if len(node.args) > 3 else node.kwargs.get("scale_factor", 1)
+            )
 
         return self._upsample_impl(
             x,
@@ -1153,6 +1158,11 @@ class ExportedProgramImporter(BaseFXGraphImporter):
 
         return self.block_builder.emit(relax.op.reshape(x, size))
 
+    ########## Symbolic Shape Constraints ##########
+
+    def _symbolic_comparison(self, _: fx.Node) -> relax.Expr:
+        return self.block_builder.emit(relax.const(True, dtype="bool"))
+
     ########## Others ##########
 
     def create_convert_map(
@@ -1367,6 +1377,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "any.dim": self._any,
             "any.dims": self._any,
             "mean.dim": self._mean,
+            "mean.default": self._mean,
             "prod.default": self._prod,
             "std.correction": self._std,
             "sum.default": self._sum,
@@ -1457,6 +1468,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "linspace.default": self._linspace,
             "masked_fill.Scalar": self._masked_fill,
             "masked_fill_.Scalar": self._inplace_masked_fill,
+            "masked_select.default": self._masked_select,
             "new_ones.default": self._new_ones,
             "new_zeros.default": self._new_zeros,
             "one_hot.default": self._one_hot,
@@ -1477,6 +1489,11 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "item.default": self._item,
             "sym_size.int": self._sym_size_int,
             "_local_scalar_dense.default": self._item,
+            # symbolic shape constraints (no-ops for compilation)
+            "sym_constrain_range_for_size.default": lambda node: self.env[node.args[0]],
+            "_assert_scalar.default": lambda node: self.env[node.args[0]],
+            "ge": self._symbolic_comparison,
+            "le": self._symbolic_comparison,
         }
 
     def _process_derived_symbol(
@@ -1604,9 +1621,18 @@ class ExportedProgramImporter(BaseFXGraphImporter):
         keep_params_as_input: bool,
         unwrap_unit_return_tuple: bool,
         no_bind_return_tuple: bool,
+        custom_convert_map: Optional[
+            Dict[str, Callable[[fx.Node, BaseFXGraphImporter], relax.Var]]
+        ],
     ) -> tvm.IRModule:
         """Convert a PyTorch ExportedProgram to a Relax program."""
-        from torch import fx  # type: ignore
+
+        # Update the conversion map with custom ops if provided.
+        if custom_convert_map:
+            custom_ops = set(custom_convert_map.keys())
+            self.update_convert_map(custom_convert_map)
+        else:
+            custom_ops = set()
 
         # Create input variables.
         (
@@ -1671,7 +1697,10 @@ class ExportedProgramImporter(BaseFXGraphImporter):
                         self.env[node] = getattr(exported_program.graph_module, node.target)
                     elif node.op == "call_function":
                         func_name = node.target.__name__
-                        self.env[node] = self.convert_map[func_name](node)
+                        if func_name in custom_ops:
+                            self.env[node] = self.convert_map[func_name](node, self)
+                        else:
+                            self.env[node] = self.convert_map[func_name](node)
                     else:
                         raise ValueError(f"Unsupported op {node.op}")
             assert output is not None
@@ -1711,6 +1740,9 @@ def from_exported_program(
     keep_params_as_input: bool = False,
     unwrap_unit_return_tuple: bool = False,
     no_bind_return_tuple: bool = False,
+    custom_convert_map: Optional[
+        Dict[str, Callable[[fx.Node, BaseFXGraphImporter], relax.Var]]
+    ] = None,
     run_ep_decomposition: bool = True,
 ) -> tvm.IRModule:
     """Convert a PyTorch ExportedProgram to a Relax program
@@ -1730,6 +1762,9 @@ def from_exported_program(
     no_bind_return_tuple : bool
         A boolean flag indicating whether to bind the return tuple as a relax var.
         If the flag is true and the return value is a tuple, it will not bind it to a var.
+
+    custom_convert_map : Dict[str, Callable[[fx.Node, BaseFXGraphImporter], relax.Var]]
+        A custom op conversion map in the same format as ExportedProgramImporter.convert_map above
 
     run_ep_decomposition : bool
         A boolean flag indicating whether to run PyTorch's decomposition on the
@@ -1784,4 +1819,5 @@ def from_exported_program(
         keep_params_as_input,
         unwrap_unit_return_tuple,
         no_bind_return_tuple,
+        custom_convert_map,
     )

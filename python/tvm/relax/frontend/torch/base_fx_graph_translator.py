@@ -23,6 +23,7 @@ from functools import reduce
 import math
 from typing import Callable, Dict, Optional, Tuple, Union, List
 
+import tvm
 from tvm import relax, tir
 
 
@@ -44,6 +45,17 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         ] = self.create_convert_map()
 
     ########## Utilities ##########
+
+    def update_convert_map(self, custom_convert_map: Dict[str, Callable]):
+        """Update self.convert_map with custom convert map
+
+        Parameters
+        ----------
+        custom_convert_map : Dict[str, Callable]
+            A custom op conversion map in the same format as self.convert_map
+        """
+
+        self.convert_map.update(custom_convert_map)
 
     @staticmethod
     def _convert_data_type(input_type: Union[str, torch.dtype], env: Optional[Dict] = None):
@@ -1616,10 +1628,12 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
 
     def _sum(self, node: fx.Node) -> relax.Var:
         args = self.retrieve_args(node)
-        keepdim = node.kwargs["keepdim"] if "keepdim" in node.kwargs else False
-        if len(args) == 1:
-            return self.block_builder.emit(relax.op.sum(args[0], keepdims=keepdim))
-        return self.block_builder.emit(relax.op.sum(args[0], args[1]))
+        x = args[0]
+        dim = args[1] if len(node.args) > 1 else node.kwargs.get("dim", None)
+        if isinstance(dim, (list, tuple)) and len(dim) == 0:
+            dim = None
+        keepdim = args[2] if len(node.args) > 2 else node.kwargs.get("keepdim", False)
+        return self.block_builder.emit(relax.op.sum(x, dim, keepdims=keepdim))
 
     def _var(self, node: fx.Node) -> relax.Var:
         args = self.retrieve_args(node)
@@ -2384,6 +2398,26 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
             x = self.block_builder.emit(relax.op.astype(x, fill_dtype))
 
         return self.block_builder.emit(relax.op.where(mask, values, x))
+
+    def _masked_select(self, node: fx.Node) -> relax.Var:
+        data = self.env[node.args[0]]
+        mask = self.env[node.args[1]]
+
+        data_shape = self.shape_of(data)
+        mask_shape = self.shape_of(mask)
+        shapes_equal = tvm.ir.structural_equal(data_shape, mask_shape)
+
+        if not shapes_equal:
+            mask = self.block_builder.emit(relax.op.broadcast_to(mask, data_shape))
+
+        data_flat = self.block_builder.emit(relax.op.reshape(data, [-1]))
+        mask_flat = self.block_builder.emit(relax.op.reshape(mask, [-1]))
+        indices = self.block_builder.emit(relax.op.nonzero(mask_flat))
+        indices_1d = self.block_builder.emit(relax.op.squeeze(indices, axis=[0]))
+
+        result = self.block_builder.emit(relax.op.take(data_flat, indices_1d, axis=0))
+
+        return result
 
     def _new_ones(self, node: fx.Node) -> relax.Var:
         args = self.retrieve_args(node)
