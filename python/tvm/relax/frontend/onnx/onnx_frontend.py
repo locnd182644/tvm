@@ -3834,6 +3834,24 @@ class AllClassNMS(OnnxOpConverter):
         return nms_out
 
 
+class Dropout(OnnxOpConverter):
+    """Converts an onnx Dropout node into an equivalent Relax expression."""
+
+    @classmethod
+    def _impl_v1(cls, bb, inputs, attr, params):
+        data = inputs[0]
+        ratio = attr.get("ratio", 0.5)  # Ignored in inference
+        mask = relax.op.ones_like(data, dtype="bool")
+        return relax.Tuple([data, mask])
+
+    @classmethod
+    def _impl_v12(cls, bb, inputs, attr, params):
+        data = inputs[0]
+        ratio = inputs[1] if len(inputs) > 1 else 0.5  # Ignored in inference
+        mask = relax.op.ones_like(data, dtype="bool")
+        return relax.Tuple([data, mask])
+
+
 def _get_convert_map():
     return {
         # defs/experimental
@@ -4000,6 +4018,7 @@ def _get_convert_map():
         "ConcatFromSequence": ConcatFromSequence,
         "SplitToSequence": SplitToSequence,
         "SequenceAt": SequenceAt,
+        "Dropout": Dropout,
     }
 
 

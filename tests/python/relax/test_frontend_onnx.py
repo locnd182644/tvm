@@ -3933,5 +3933,35 @@ def test_nms_score_threshold():
         )
 
 
+def test_dropout():
+    test_node = helper.make_node(
+        "Dropout",
+        inputs=["x", "ratio", "training"],
+        outputs=["y", "mask"],
+    )
+
+    # training = False
+    initializer = [
+        helper.make_tensor("ratio", TensorProto.FLOAT, [], [0.5]),
+        helper.make_tensor("training", TensorProto.BOOL, [], [0]),
+    ]
+
+    graph = helper.make_graph(
+        [test_node],
+        "dropout_test",
+        inputs=[
+            helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 3, 32, 32]),
+        ],
+        outputs=[
+            helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 3, 32, 32]),
+            helper.make_tensor_value_info("mask", TensorProto.BOOL, [1, 3, 32, 32]),
+        ],
+        initializer=initializer,
+    )
+
+    model = helper.make_model(graph, producer_name="dropout_test")
+    check_correctness(model)
+
+
 if __name__ == "__main__":
     tvm.testing.main()
