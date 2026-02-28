@@ -552,7 +552,6 @@ TVM_FFI_STATIC_INIT_BLOCK() {
                tmp->manager_ctx = nullptr;
                tmp->deleter = nullptr;
                Tensor data = Tensor::FromDLPack(tmp.release());
-               
                return data.CreateView(new_shape, data->dtype);
              } else {
                TVM_FFI_THROW(TypeError)
